@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
         .get_matches();
 
     match cli.subcommand() {
-        Some(("repipe", _)) => ui.repipe_interactive().await?,
+        Some(("repipe", _)) => ui.repipe_interactive(),
         Some(("template", _)) => ui.manage_template_version().await?,
         Some(("ci", _)) => ui.manage_ci().await?,
         _ => {
