@@ -1,4 +1,50 @@
-use anyhow::{Result, Context};
+use anyhow::{bail, Result, Context};
+use serde::Deserialize;
+use std::{env, path::{Path, PathBuf}};
+
+#[derive(Debug, Deserialize)]
+struct PipelineMeta {
+    target: Option<String>,
+    url: Option<String>,
+    team: Option<String>,
+    pipeline: Option<String>,
+    name: Option<String>,
+    exposed: Option<bool>,
+}
+
+fn find_ci_directory(kit: &str) -> Result<PathBuf> {
+    let current_dir = env::current_dir().context("Failed to get current directory")?;
+    
+    // Check common locations
+    let possible_paths = vec![
+        current_dir.join(kit).join("ci"),
+        current_dir.join("ci"),
+        current_dir.parent().map(|p| p.join("ci")).unwrap_or_default(),
+    ];
+    
+    for path in possible_paths {
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    
+    bail!("Could not find ci directory for kit {}", kit)
+}
+
+fn determine_settings_file(ci_dir: &Path) -> Result<PathBuf> {
+    if let Ok(target) = env::var("CONCOURSE_TARGET") {
+        let target_file = ci_dir.join(format!("settings-{}.yml", target.replace(['/', ' '], "-")));
+        if target_file.exists() {
+            return Ok(target_file);
+        }
+    }
+    
+    let default_settings = ci_dir.join("settings.yml");
+    if default_settings.exists() {
+        Ok(default_settings)
+    } else {
+        bail!("Missing settings.yml in {:?}", ci_dir)
+    }}
 use dialoguer::Select;
 use std::{thread, time::Duration, process::Command};
 use tabled::Table;
@@ -52,11 +98,67 @@ impl GenesisKitUI {
     async fn view_ci_status(&self) -> Result<()> {
         println!("\n{}", heading("📊 CI STATUS"));
         
+        // First get pipeline configuration and extract meta
         let mut statuses = Vec::new();
         
         for kit in AVAILABLE_KITS {
+            // Find ci directory and read pipeline config
+            let ci_dir = find_ci_directory(kit)?;
+            let settings_file = determine_settings_file(&ci_dir)?;
+            
+            // Merge pipeline configuration using spruce
+            let base_yml = ci_dir.join("pipeline").join("base.yml");
+            if !base_yml.exists() {
+                println!("{}", style(format!("⚠️  Skipping {}: No pipeline/base.yml found", kit)).yellow());
+                continue;
+            }
+            
+            let merged_config = Command::new("spruce")
+                .arg("merge")
+                .arg("--fallback-append")
+                .arg(&base_yml)
+                .arg(&settings_file)
+                .output()
+                .context("Failed to merge pipeline config")?;
+                
+            if !merged_config.status.success() {
+                println!("{}", style(format!("⚠️  Skipping {}: Failed to merge pipeline config", kit)).yellow());
+                continue;
+            }
+            
+            // Extract meta information
+            let mut meta_output = Command::new("spruce")
+                .args(&["merge", "--skip-eval", "--cherry-pick", "meta"])
+                .arg("-")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .context("Failed to spawn meta command")?;
+
+            {
+                let mut stdin = meta_output.stdin.take().unwrap();
+                use std::io::Write;
+                stdin.write_all(&merged_config.stdout)?;
+            }
+
+            let meta_result = meta_output.wait_with_output().context("Failed to get meta output")?;
+            let meta: PipelineMeta = if meta_result.status.success() {
+                #[derive(Deserialize)]
+                struct MetaWrapper { meta: PipelineMeta }
+                let wrapper: MetaWrapper = serde_yaml::from_str(&String::from_utf8(meta_result.stdout)?)?;
+                wrapper.meta
+            } else {
+                continue;
+            };
+            
+            // Get pipeline name from meta
+            let pipeline_name = meta.pipeline
+                .or(meta.name)
+                .unwrap_or_else(|| format!("genesis-kit-{}", kit));
+            
+            // Now fetch the build status using the correct pipeline name
             let output = AsyncCommand::new("fly")
-                .args(["builds", "-j", &format!("genesis-kits/{}", kit)])
+                .args(["builds", "-j", &format!("{}/test-kit", pipeline_name)])
                 .output()
                 .await
                 .context("Failed to fetch build status")?;
