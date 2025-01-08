@@ -2,6 +2,7 @@ use std::{env, path::{Path, PathBuf}, process::Command, fs};
 use serde::{Deserialize, Serialize};
 use anyhow::{Result, Context, bail};
 use log::error;
+use walkdir::WalkDir;
 use crate::GenesisKitUI;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -15,6 +16,7 @@ pub struct RepipeOptions {
     pub open_browser: u8,
     pub yes: bool,
     pub fly_path: Option<String>,
+    pub debug: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,88 +38,132 @@ pub struct RepipeCommand {
     pipeline: String,
 }
 
+impl Drop for RepipeCommand {
+    fn drop(&mut self) {
+        if !self.options.debug {
+            let _ = fs::remove_file(".deploy.yml");
+        }
+        let _ = fs::remove_dir_all(self.base_dir.join("pipeline").join("upstream"));
+        let _ = fs::remove_dir_all(self.base_dir.join("pipeline").join("tests"));
+    }
+}
+
 impl RepipeCommand {
     pub fn new(options: RepipeOptions) -> Result<Self> {
         let base_dir = Self::find_ci_directory()?;
         env::set_current_dir(&base_dir)?;
-        
-        Ok(Self {
-            options,
-            base_dir,
-            settings_file: String::from("settings.yml"),
-            meta: None,
-            target: String::new(),
-            pipeline: String::new(),
+        Ok(Self { 
+            options, 
+            base_dir, 
+            settings_file: String::from("settings.yml"), 
+            meta: None, 
+            target: String::new(), 
+            pipeline: String::new() 
         })
     }
 
     fn find_ci_directory() -> Result<PathBuf> {
-        let current_dir = env::current_dir()?;
-        if current_dir.ends_with("ci") {
-            return Ok(current_dir);
-        }
+        let current_dir = env::current_dir().context("Failed to get current directory")?;
+        error!("Searching for ci directory from: {}", current_dir.display());
         
-        let ci_dir = current_dir.join("ci").exists()
-            .then_some(current_dir.join("ci"))
-            .or_else(|| current_dir.parent().map(|p| p.join("ci")).filter(|p| p.exists()))
-            .context("Could not find ci directory")?;
+        if current_dir.ends_with("ci") {
+            error!("Current directory ends with 'ci': {}", current_dir.display());
+            Ok(current_dir)
+        } else {
+            let ci_current = current_dir.join("ci");
+            let ci_parent = current_dir.parent().map(|p| p.join("ci"));
             
-        Ok(ci_dir)
+            error!("Checking ci in current dir: {}", ci_current.display());
+            if ci_current.exists() {
+                error!("Found ci directory in current: {}", ci_current.display());
+                return Ok(ci_current);
+            }
+            
+            let parent_ci_str = ci_parent.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "N/A".to_string());
+            if let Some(parent_ci) = ci_parent {
+                error!("Checking ci in parent: {}", parent_ci.display());
+                if parent_ci.exists() {
+                    error!("Found ci directory in parent: {}", parent_ci.display());
+                    return Ok(parent_ci);
+                }
+            }
+            
+            bail!("Could not find ci directory. Checked:\n- Current dir: {}\n- ./ci: {}\n- ../ci: {}", 
+                  current_dir.display(),
+                  ci_current.display(),
+                  parent_ci_str)
+        }
     }
 
     fn check_requirements(&self) -> Result<()> {
-        let required_commands = vec![
-            ("which", None),
-            ("spruce", Some("https://github.com/geofffranks/spruce/releases")),
-            ("jq", None),
-        ];
-
-        for (cmd, url) in required_commands {
+        for (cmd, url) in [("spruce", Some("https://github.com/geofffranks/spruce/releases")), 
+                          ("jq", None)] {
             Command::new("which").arg(cmd).output()
                 .map_err(|_| anyhow::anyhow!("'{}' command not found{}", cmd, 
                     url.map(|u| format!("\nDownload from: {}", u))
                         .unwrap_or_else(|| String::from("\nInstall via package manager"))))?;
         }
-
+        
         if let Some(path) = &self.options.fly_path {
             #[cfg(unix)]
             if fs::metadata(path)?.permissions().mode() & 0o111 == 0 {
                 bail!("Specified fly path '{}' is not executable", path);
             }
-        } else {
-            Command::new("which").arg("fly").output()?;
+        } else { 
+            Command::new("which").arg("fly").output()?; 
         }
         Ok(())
     }
 
     fn find_settings_file(&mut self) -> Result<()> {
         if let Ok(target) = env::var("CONCOURSE_TARGET") {
-            let target_file = format!("settings-{}.yml", target.replace('/', "-").replace(' ', "_"));
+            let target_file = format!("settings-{}.yml", target.replace(['/', ' '], "-"));
             if Path::new(&target_file).exists() {
                 self.settings_file = target_file;
             }
         }
-
         if !Path::new(&self.settings_file).exists() {
             bail!("Missing local settings in ci/settings.yml!");
         }
         Ok(())
     }
+    
+    fn execute_build_scripts(&self) -> Result<()> {
+        for script in ["build-test-jobs", "build-upstream-jobs"] {
+            let script_path = self.base_dir.join("scripts").join(script);
+            if script_path.exists() {
+                #[cfg(unix)]
+                let is_executable = fs::metadata(&script_path)?.permissions().mode() & 0o111 != 0;
+                #[cfg(windows)]
+                let is_executable = true;
+                if is_executable {
+                    Command::new(&script_path).status()?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn merge_pipeline_config(&self) -> Result<String> {
-
         let base_yml = self.base_dir.join("pipeline").join("base.yml");
-        if !base_yml.exists() {
-            bail!("Missing pipeline/base.yml file");
+        if !base_yml.exists() { 
+            bail!("Missing pipeline/base.yml file"); 
         }
 
         let mut yaml_files = vec![base_yml];
         let pipeline_dir = self.base_dir.join("pipeline");
+        
         if pipeline_dir.exists() {
-            for entry in fs::read_dir(&pipeline_dir)? {
-                let path = entry?.path();
-                if path.extension().map_or(false, |ext| ext == "yml") {
-                    yaml_files.push(path);
+            for entry in WalkDir::new(&pipeline_dir).min_depth(1).into_iter()
+                .filter_entry(|e| {
+                    let path = e.path().to_string_lossy();
+                    !path.contains("custom") && !path.contains("optional")
+                }) {
+                if let Ok(entry) = entry {
+                    let path = entry.path().to_path_buf();
+                    if path.extension().map_or(false, |ext| ext == "yml") {
+                        yaml_files.push(path);
+                    }
                 }
             }
         }
@@ -130,19 +176,22 @@ impl RepipeCommand {
             .output()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to merge pipeline configuration: {}", stderr);
+            bail!("Failed to merge pipeline configuration: {}", 
+                  String::from_utf8_lossy(&output.stderr));
         }
 
         let yaml_output = String::from_utf8(output.stdout)?;
-        // Validate YAML format
-        if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&yaml_output) {
-            bail!("Invalid YAML output: {}", e);
-        }
+        serde_yaml::from_str::<serde_yaml::Value>(&yaml_output)?;
 
-        // Write the YAML output to .deploy.yml for fly
-        fs::write(".deploy.yml", &yaml_output)?;
+        if self.options.debug {
+            fs::write("repipe-debug.yml", &yaml_output)?;
+            println!("Debug output written to repipe-debug.yml");
+            std::process::exit(0);
+        }
         
+        fs::write("./.deploy.yml", &yaml_output)?;
+        println!("Pipeline configuration written to .deploy.yml");
+        println!("Current working directory: {:?}", std::env::current_dir()?);
         Ok(yaml_output)
     }
 
@@ -160,10 +209,8 @@ impl RepipeCommand {
         }
 
         let output = child.wait_with_output()?;
-
         #[derive(Deserialize)]
         struct MetaWrapper { meta: PipelineMeta }
-        
         let wrapper: MetaWrapper = serde_yaml::from_str(&String::from_utf8(output.stdout)?)?;
         self.meta = Some(wrapper.meta);
 
@@ -171,7 +218,6 @@ impl RepipeCommand {
             self.target = meta.target.clone()
                 .or_else(|| env::var("CONCOURSE_TARGET").ok())
                 .context("Missing target")?;
-
             self.pipeline = meta.pipeline.clone()
                 .or_else(|| meta.name.clone())
                 .context("Missing pipeline name")?;
@@ -212,13 +258,15 @@ impl RepipeCommand {
     pub fn execute(&mut self) -> Result<()> {
         self.check_requirements()?;
         self.find_settings_file()?;
+        self.execute_build_scripts()?;
         
         let config = self.merge_pipeline_config()?;
+        // If debug flag is set, merge_pipeline_config will exit early
+        
         self.extract_meta(&config)?;
         self.validate_target()?;
 
         let fly = self.options.fly_path.clone().unwrap_or_else(|| String::from("fly"));
-
         match (self.options.validate, self.options.dry_run) {
             (v, 0) if v > 0 => {
                 Command::new(&fly)
@@ -229,21 +277,18 @@ impl RepipeCommand {
             },
             (0, d) if d > 0 => println!("{}", fs::read_to_string(".deploy.yml")?),
             _ => {
-                // Set pipeline
                 Command::new(&fly)
                     .args(&["--target", &self.target, "set-pipeline", "--pipeline", &self.pipeline])
                     .args(&["--config", ".deploy.yml"])
                     .arg(if self.options.yes { "--non-interactive" } else { "" })
                     .status()?;
 
-                // Pause/unpause
-                let pause_cmd = if self.options.pause { "pause" } else { "unpause" };
                 Command::new(&fly)
-                    .args(&["--target", &self.target, &format!("{}-pipeline", pause_cmd)])
+                    .args(&["--target", &self.target, 
+                           &format!("{}-pipeline", if self.options.pause { "pause" } else { "unpause" })])
                     .args(&["--pipeline", &self.pipeline])
                     .status()?;
 
-                // Expose/hide
                 let expose = self.options.expose
                     .unwrap_or_else(|| self.meta.as_ref().and_then(|m| m.exposed).unwrap_or(false));
                 Command::new(&fly)
